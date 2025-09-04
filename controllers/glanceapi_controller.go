@@ -100,7 +100,11 @@ func (r *GlanceAPIReconciler) GetLogger(ctx context.Context) logr.Logger {
 // Reconcile reconcile Glance API requests
 func (r *GlanceAPIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, _err error) {
 	Log := r.GetLogger(ctx)
-	Log.Info("=== GlanceAPI Reconcile triggered ===", "name", req.Name, "namespace", req.Namespace)
+	Log.Info("*** GLANCE RECONCILE ENTRY POINT ***", "name", req.Name, "namespace", req.Namespace, "namespacedName", req.NamespacedName)
+
+	defer func() {
+		Log.Info("*** GLANCE RECONCILE EXIT POINT ***", "name", req.Name, "result", result, "error", _err)
+	}()
 
 	// Fetch the GlanceAPI instance
 	instance := &glancev1.GlanceAPI{}
@@ -110,12 +114,14 @@ func (r *GlanceAPIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			// Request object not found, could have been deleted after reconcile request.
 			// Owned objects are automatically garbage collected.
 			// For additional cleanup logic use finalizers. Return and don't requeue.
+			Log.Info("GlanceAPI instance not found, likely deleted", "name", req.Name, "namespace", req.Namespace)
 			return ctrl.Result{}, nil
 		}
 		// Error reading the object - requeue the request.
-		Log.Error(err, fmt.Sprintf("could not fetch GlanceAPI instance %s", instance.Name))
+		Log.Error(err, fmt.Sprintf("could not fetch GlanceAPI instance %s", req.Name))
 		return ctrl.Result{}, err
 	}
+	Log.Info("Successfully fetched GlanceAPI instance", "name", instance.Name, "namespace", instance.Namespace)
 
 	helper, err := helper.NewHelper(
 		instance,
@@ -368,51 +374,6 @@ func (r *GlanceAPIReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Man
 		return nil
 	}
 
-	// Watch for changes to keystone-overrides secrets for SKMO support
-	keystoneOverridesFn := func(_ context.Context, o client.Object) []reconcile.Request {
-		result := []reconcile.Request{}
-
-		// Only handle Secret objects with keystone-overrides label
-		if _, isSecret := o.(*corev1.Secret); !isSecret {
-			return nil
-		}
-
-		labels := o.GetLabels()
-		if labels == nil {
-			return nil
-		}
-
-		if _, hasLabel := labels[glance.KeystoneOverridesLabel]; !hasLabel {
-			return nil
-		}
-
-		// Check that the label value is "true"
-		if labels[glance.KeystoneOverridesLabel] != "true" {
-			return nil
-		}
-
-		// get all GlanceAPI CRs and reconcile them when keystone-overrides secret changes
-		glanceAPIs := &glancev1.GlanceAPIList{}
-		listOpts := []client.ListOption{
-			client.InNamespace(o.GetNamespace()),
-		}
-		if err := r.Client.List(context.Background(), glanceAPIs, listOpts...); err != nil {
-			Log.Error(err, "Unable to retrieve GlanceAPI CRs for keystone-overrides secret change")
-			return nil
-		}
-
-		for _, cr := range glanceAPIs.Items {
-			name := client.ObjectKey{
-				Namespace: o.GetNamespace(),
-				Name:      cr.Name,
-			}
-			Log.Info(fmt.Sprintf("Keystone overrides secret %s changed, reconciling GlanceAPI %s", o.GetName(), cr.Name))
-			result = append(result, reconcile.Request{NamespacedName: name})
-		}
-
-		return result
-	}
-
 	cBuilder := ctrl.NewControllerManagedBy(mgr).
 		For(&glancev1.GlanceAPI{}).
 		Owns(&keystonev1.KeystoneEndpoint{}).
@@ -438,10 +399,9 @@ func (r *GlanceAPIReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Man
 			builder.WithPredicates(keystonev1.KeystoneAPIStatusChangedPredicate)).
 		Watches(&horizonv1.Horizon{},
 			handler.EnqueueRequestsFromMapFunc(r.findObjectForSrc),
-			builder.WithPredicates(horizonv1.HorizonEndpointChangedPredicate)).
-		Watches(&corev1.Secret{},
-			handler.EnqueueRequestsFromMapFunc(keystoneOverridesFn),
-			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}))
+			builder.WithPredicates(horizonv1.HorizonEndpointChangedPredicate))
+
+	cBuilder = AddKeystoneOverridesWatches(cBuilder, r)
 
 	return cBuilder.Complete(r)
 }
@@ -1792,4 +1752,68 @@ func (r *GlanceAPIReconciler) GetHorizonEndpoint(
 	}
 
 	return ep, nil
+}
+
+// AddKeystoneOverridesWatches adds keystone-overrides secret watches to the passed controller builder
+func AddKeystoneOverridesWatches(b *builder.Builder, r *GlanceAPIReconciler) *builder.Builder {
+	Log := r.GetLogger(context.Background())
+
+	keystoneOverridesMap := handler.MapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
+		// Only handle Secret objects with keystone-overrides label
+		if _, isSecret := obj.(*corev1.Secret); !isSecret {
+			return nil
+		}
+
+		labels := obj.GetLabels()
+		if labels == nil {
+			return nil
+		}
+
+		if _, hasLabel := labels[glance.KeystoneOverridesLabel]; !hasLabel {
+			return nil
+		}
+
+		// Check that the label value is "true"
+		if labels[glance.KeystoneOverridesLabel] != "true" {
+			return nil
+		}
+
+		Log.Info("=== Keystone overrides watcher triggered ===", "object", obj.GetName(), "namespace", obj.GetNamespace())
+		Log.Info("Found keystone-overrides secret, looking for GlanceAPI instances", "secret", obj.GetName())
+
+		// get all GlanceAPI CRs and reconcile them when keystone-overrides secret changes
+		glanceAPIs := &glancev1.GlanceAPIList{}
+		listOpts := []client.ListOption{
+			client.InNamespace(obj.GetNamespace()),
+		}
+		if err := r.Client.List(context.Background(), glanceAPIs, listOpts...); err != nil {
+			Log.Error(err, "Unable to retrieve GlanceAPI CRs for keystone-overrides secret change")
+			return nil
+		}
+
+		Log.Info("Found GlanceAPI instances", "count", len(glanceAPIs.Items), "namespace", obj.GetNamespace())
+
+		result := []reconcile.Request{}
+		for _, cr := range glanceAPIs.Items {
+			name := client.ObjectKey{
+				Namespace: obj.GetNamespace(),
+				Name:      cr.Name,
+			}
+			Log.Info("Keystone overrides secret changed", "secret", obj.GetName(), "enqueuing", cr.Name)
+			Log.Info("Enqueuing reconcile request", "namespace", name.Namespace, "name", name.Name)
+			result = append(result, reconcile.Request{NamespacedName: name})
+		}
+
+		Log.Info("Returning reconcile requests", "count", len(result))
+		return result
+	})
+
+	// watch the keystone-overrides Secret
+	b = b.Watches(
+		&corev1.Secret{},
+		handler.EnqueueRequestsFromMapFunc(keystoneOverridesMap),
+		builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
+	)
+
+	return b
 }
