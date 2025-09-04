@@ -100,6 +100,7 @@ func (r *GlanceAPIReconciler) GetLogger(ctx context.Context) logr.Logger {
 // Reconcile reconcile Glance API requests
 func (r *GlanceAPIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, _err error) {
 	Log := r.GetLogger(ctx)
+	Log.Info("=== GlanceAPI Reconcile triggered ===", "name", req.Name, "namespace", req.Namespace)
 
 	// Fetch the GlanceAPI instance
 	instance := &glancev1.GlanceAPI{}
@@ -208,6 +209,7 @@ func (r *GlanceAPIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		cl.Set(c)
 	}
 	// Handle non-deleted clusters
+	Log.Info("Calling reconcileNormal", "instance", instance.Name)
 	return r.reconcileNormal(ctx, instance, helper)
 }
 
@@ -945,8 +947,10 @@ func (r *GlanceAPIReconciler) reconcileNormal(
 	}
 
 	// Check for keystone overrides for multi-region deployments
+	Log.Info("=== Checking for keystone overrides ===", "namespace", instance.Namespace, "label", glance.KeystoneOverridesLabel)
 	keystoneOverrides, ctrlResult, err := keystone.GetKeystoneOverridesByLabel(
 		ctx, helper, instance.Namespace, glance.KeystoneOverridesLabel, "true", glance.NormalDuration)
+	Log.Info("GetKeystoneOverridesByLabel result", "overrides", keystoneOverrides, "ctrlResult", ctrlResult, "err", err)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -958,7 +962,14 @@ func (r *GlanceAPIReconciler) reconcileNormal(
 	}
 	if (ctrlResult != ctrl.Result{}) {
 		// No keystone-overrides secret found, continue with normal keystone discovery
+		Log.Info("No keystone-overrides secret found, using normal keystone discovery")
 		keystoneOverrides = nil
+	} else {
+		// Log the keystone overrides that were found
+		Log.Info("Found keystone overrides", "overrides", keystoneOverrides, "count", len(keystoneOverrides))
+		for key, value := range keystoneOverrides {
+			Log.Info("Keystone override", "key", key, "value", value)
+		}
 	}
 
 	// Add keystone overrides to configVars to ensure pod restart when secret changes
@@ -972,15 +983,19 @@ func (r *GlanceAPIReconciler) reconcileNormal(
 			err.Error()))
 		return ctrl.Result{}, err
 	}
+	Log.Info("Computed keystone overrides hash", "hash", keystoneOverridesHash)
 	configVars["keystone-overrides"] = env.SetValue(keystoneOverridesHash)
 
 	// Add individual override fields to ensure they're tracked in the hash
 	if keystoneOverrides != nil {
+		Log.Info("Adding keystone override fields to configVars")
 		for key, value := range keystoneOverrides {
+			Log.Info("Adding keystone override to configVars", "key", "keystone-override-"+key, "value", value)
 			configVars["keystone-override-"+key] = env.SetValue(value)
 		}
 	} else {
-		// Ensure stable keys so transitions (present->absent) change the hash
+		// Ensure stable keys so transition present->absent) change the hash
+		Log.Info("No keystone overrides found, adding empty placeholder keys to configVars")
 		configVars["keystone-override-region"] = env.SetValue("")
 		configVars["keystone-override-auth_url"] = env.SetValue("")
 		configVars["keystone-override-www_authenticate_uri"] = env.SetValue("")
@@ -1003,12 +1018,6 @@ func (r *GlanceAPIReconciler) reconcileNormal(
 	// normal reconcile tasks
 	//
 
-	// Ensure pod template annotations reflect keystone overrides so StatefulSet rolls
-	if serviceAnnotations == nil {
-		serviceAnnotations = map[string]string{}
-	}
-	serviceAnnotations["glance.openstack.org/keystone-overrides-hash"] = keystoneOverridesHash
-
 	//
 	// create hash over all the different input resources to identify if any those changed
 	// and a restart/recreate is required.
@@ -1023,6 +1032,7 @@ func (r *GlanceAPIReconciler) reconcileNormal(
 			err.Error()))
 		return ctrl.Result{}, err
 	}
+	Log.Info("Computed final inputHash", "hash", inputHash, "configVarsCount", len(configVars))
 
 	// At this point the config is generated and the inputHash is computed
 	// we can mark the ServiceConfigReady as True and rollout the new pods
