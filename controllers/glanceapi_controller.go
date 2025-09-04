@@ -55,6 +55,7 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/endpoint"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/env"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/keystone"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
 	nad "github.com/openstack-k8s-operators/lib-common/modules/common/networkattachment"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/secret"
@@ -365,7 +366,52 @@ func (r *GlanceAPIReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Man
 		return nil
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
+	// Watch for changes to keystone-overrides secrets for SKMO support
+	keystoneOverridesFn := func(_ context.Context, o client.Object) []reconcile.Request {
+		result := []reconcile.Request{}
+
+		// Only handle Secret objects with keystone-overrides label
+		if _, isSecret := o.(*corev1.Secret); !isSecret {
+			return nil
+		}
+
+		labels := o.GetLabels()
+		if labels == nil {
+			return nil
+		}
+
+		if _, hasLabel := labels[glance.KeystoneOverridesLabel]; !hasLabel {
+			return nil
+		}
+
+		// Check that the label value is "true"
+		if labels[glance.KeystoneOverridesLabel] != "true" {
+			return nil
+		}
+
+		// get all GlanceAPI CRs and reconcile them when keystone-overrides secret changes
+		glanceAPIs := &glancev1.GlanceAPIList{}
+		listOpts := []client.ListOption{
+			client.InNamespace(o.GetNamespace()),
+		}
+		if err := r.Client.List(context.Background(), glanceAPIs, listOpts...); err != nil {
+			Log.Error(err, "Unable to retrieve GlanceAPI CRs for keystone-overrides secret change")
+			return nil
+		}
+
+		for _, cr := range glanceAPIs.Items {
+			name := client.ObjectKey{
+				Namespace: o.GetNamespace(),
+				Name:      cr.Name,
+			}
+			Log.Info(fmt.Sprintf("Keystone overrides secret %s changed, reconciling GlanceAPI %s", o.GetName(), cr.Name))
+			result = append(result, reconcile.Request{NamespacedName: name})
+		}
+
+		return result
+	}
+
+	cBuilder := ctrl.NewControllerManagedBy(mgr).
 		For(&glancev1.GlanceAPI{}).
 		Owns(&keystonev1.KeystoneEndpoint{}).
 		Owns(&corev1.Service{}).
@@ -391,7 +437,11 @@ func (r *GlanceAPIReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Man
 		Watches(&horizonv1.Horizon{},
 			handler.EnqueueRequestsFromMapFunc(r.findObjectForSrc),
 			builder.WithPredicates(horizonv1.HorizonEndpointChangedPredicate)).
-		Complete(r)
+		Watches(&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(keystoneOverridesFn),
+			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}))
+
+	return cBuilder.Complete(r)
 }
 
 func (r *GlanceAPIReconciler) findObjectsForSrc(ctx context.Context, src client.Object) []reconcile.Request {
@@ -894,8 +944,50 @@ func (r *GlanceAPIReconciler) reconcileNormal(
 		wsgi = true
 	}
 
+	// Check for keystone overrides for multi-region deployments
+	keystoneOverrides, ctrlResult, err := keystone.GetKeystoneOverridesByLabel(
+		ctx, helper, instance.Namespace, glance.KeystoneOverridesLabel, "true", glance.NormalDuration)
+	if err != nil {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.ServiceConfigReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			condition.ServiceConfigReadyErrorMessage,
+			err.Error()))
+		return ctrl.Result{}, err
+	}
+	if (ctrlResult != ctrl.Result{}) {
+		// No keystone-overrides secret found, continue with normal keystone discovery
+		keystoneOverrides = nil
+	}
+
+	// Add keystone overrides to configVars to ensure pod restart when secret changes
+	keystoneOverridesHash, err := util.ObjectHash(keystoneOverrides)
+	if err != nil {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.ServiceConfigReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			condition.ServiceConfigReadyErrorMessage,
+			err.Error()))
+		return ctrl.Result{}, err
+	}
+	configVars["keystone-overrides"] = env.SetValue(keystoneOverridesHash)
+
+	// Add individual override fields to ensure they're tracked in the hash
+	if keystoneOverrides != nil {
+		for key, value := range keystoneOverrides {
+			configVars["keystone-override-"+key] = env.SetValue(value)
+		}
+	} else {
+		// Ensure stable keys so transitions (present->absent) change the hash
+		configVars["keystone-override-region"] = env.SetValue("")
+		configVars["keystone-override-auth_url"] = env.SetValue("")
+		configVars["keystone-override-www_authenticate_uri"] = env.SetValue("")
+	}
+
 	// Generate service config
-	err = r.generateServiceConfig(ctx, helper, instance, &configVars, imageConv, memcached, wsgi)
+	err = r.generateServiceConfig(ctx, helper, instance, &configVars, imageConv, memcached, wsgi, keystoneOverrides)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -910,6 +1002,12 @@ func (r *GlanceAPIReconciler) reconcileNormal(
 	//
 	// normal reconcile tasks
 	//
+
+	// Ensure pod template annotations reflect keystone overrides so StatefulSet rolls
+	if serviceAnnotations == nil {
+		serviceAnnotations = map[string]string{}
+	}
+	serviceAnnotations["glance.openstack.org/keystone-overrides-hash"] = keystoneOverridesHash
 
 	//
 	// create hash over all the different input resources to identify if any those changed
@@ -1131,6 +1229,7 @@ func (r *GlanceAPIReconciler) generateServiceConfig(
 	imageConv bool,
 	memcached *memcachedv1.Memcached,
 	wsgi bool,
+	keystoneOverrides map[string]string,
 ) error {
 	labels := labels.GetLabels(instance, labels.GetGroupLabel(glance.ServiceName), GetServiceLabels(instance))
 
@@ -1176,6 +1275,25 @@ func (r *GlanceAPIReconciler) generateServiceConfig(
 		return err
 	}
 
+	// Apply keystone overrides if available
+	finalKeystoneInternalURL := keystoneInternalURL
+	finalKeystonePublicURL := keystonePublicURL
+	finalRegion := keystoneAPI.GetRegion()
+
+	if keystoneOverrides != nil && len(keystoneOverrides) > 0 {
+		if authURL, exists := keystoneOverrides["auth_url"]; exists && authURL != "" {
+			finalKeystoneInternalURL = authURL
+		}
+
+		if wwwAuthURI, exists := keystoneOverrides["www_authenticate_uri"]; exists && wwwAuthURI != "" {
+			finalKeystonePublicURL = wwwAuthURI
+		}
+
+		if region, exists := keystoneOverrides["region"]; exists && region != "" {
+			finalRegion = region
+		}
+	}
+
 	ospSecret, _, err := secret.GetSecret(ctx, h, instance.Spec.Secret, instance.Namespace)
 	if err != nil {
 		return err
@@ -1212,8 +1330,8 @@ func (r *GlanceAPIReconciler) generateServiceConfig(
 	templateParameters := map[string]interface{}{
 		"ServiceUser":         instance.Spec.ServiceUser,
 		"ServicePassword":     string(ospSecret.Data[instance.Spec.PasswordSelectors.Service]),
-		"KeystoneInternalURL": keystoneInternalURL,
-		"KeystonePublicURL":   keystonePublicURL,
+		"KeystoneInternalURL": finalKeystoneInternalURL,
+		"KeystonePublicURL":   finalKeystonePublicURL,
 		"DatabaseConnection": fmt.Sprintf("mysql+pymysql://%s:%s@%s/%s?read_default_file=/etc/my.cnf",
 			databaseAccount.Spec.UserName,
 			string(dbSecret.Data[mariadbv1.DatabasePasswordSelector]),
@@ -1227,15 +1345,13 @@ func (r *GlanceAPIReconciler) generateServiceConfig(
 		"LogFile":      fmt.Sprintf("%s%s.log", glance.GlanceLogPath, instance.Name),
 		"VHosts":       httpdVhostConfig,
 		"Wsgi":         wsgi,
+		"Region":       finalRegion,
 	}
 
 	// (OSPRH-18291)Only set EndpointID parameter when the Endpoint has been
-	// created and the associated ID is set in the keystoneapi CR. Because we
-	// have the Keystone CR, we get the Region parameter mirrored in its
-	// .Status.
+	// created and the associated ID is set in the keystoneapi CR.
 	if len(endpointID) > 0 {
 		templateParameters["EndpointID"] = endpointID
-		templateParameters["Region"] = keystoneAPI.GetRegion()
 	}
 
 	// Configure the internal GlanceAPI to provide image location data, and the

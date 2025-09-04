@@ -16,9 +16,10 @@ limitations under the License.
 package glance
 
 import (
+	"time"
+
 	"github.com/openstack-k8s-operators/lib-common/modules/storage"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"time"
 )
 
 // CronJobType -
@@ -87,6 +88,8 @@ const (
 	// KeystoneEndpoint - indicates whether the glanceAPI should register the
 	// endpoints in keystone
 	KeystoneEndpoint = "keystoneEndpoint"
+	// KeystoneOverridesLabel label for marking secrets containing keystone overrides for SKMO
+	KeystoneOverridesLabel = "keystone-overrides"
 	//DBPurge -
 	DBPurge CronJobType = "purge"
 	//CacheCleaner -
