@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	networkv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
@@ -39,8 +40,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // fields to index to reconcile when change
@@ -299,4 +304,46 @@ func GetServiceLabels(
 		glance.GlanceAPIName:     fmt.Sprintf("%s-%s-%s", glance.ServiceName, instance.APIName(), instance.Spec.APIType),
 		common.OwnerSelector:     instance.Name,
 	}
+}
+
+// AddKeystoneOverridesWatches adds keystone-overrides secret watches to the passed controller builder
+func AddKeystoneOverridesWatches(b *builder.Builder) *builder.Builder {
+	keystoneOverridesMap := handler.MapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
+		name := obj.GetName()
+		ns := obj.GetNamespace()
+
+		// Only handle Secret objects
+		if _, isSecret := obj.(*corev1.Secret); !isSecret {
+			return nil
+		}
+
+		labels := obj.GetLabels()
+		if labels == nil {
+			return nil
+		}
+
+		if _, hasLabel := labels[glance.KeystoneOverridesLabel]; !hasLabel {
+			return nil
+		}
+
+		svc := "glance"
+		if name != "keystone-overrides" && strings.HasSuffix(name, "-keystone-overrides") {
+			svc = strings.TrimSuffix(name, "-keystone-overrides")
+		}
+
+		// enqueue reconcile
+		return []reconcile.Request{
+			{NamespacedName: types.NamespacedName{Namespace: ns, Name: svc + "-default-external-api"}},
+			{NamespacedName: types.NamespacedName{Namespace: ns, Name: svc + "-default-internal-api"}},
+		}
+	})
+
+	// watch the keystone-overrides secret
+	b = b.Watches(
+		&corev1.Secret{},
+		handler.EnqueueRequestsFromMapFunc(keystoneOverridesMap),
+		builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
+	)
+
+	return b
 }

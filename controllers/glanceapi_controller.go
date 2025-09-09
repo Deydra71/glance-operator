@@ -55,6 +55,7 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/endpoint"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/env"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/keystone"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
 	nad "github.com/openstack-k8s-operators/lib-common/modules/common/networkattachment"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/secret"
@@ -365,7 +366,7 @@ func (r *GlanceAPIReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Man
 		return nil
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
+	cBuilder := ctrl.NewControllerManagedBy(mgr).
 		For(&glancev1.GlanceAPI{}).
 		Owns(&keystonev1.KeystoneEndpoint{}).
 		Owns(&corev1.Service{}).
@@ -390,8 +391,12 @@ func (r *GlanceAPIReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Man
 			builder.WithPredicates(keystonev1.KeystoneAPIStatusChangedPredicate)).
 		Watches(&horizonv1.Horizon{},
 			handler.EnqueueRequestsFromMapFunc(r.findObjectForSrc),
-			builder.WithPredicates(horizonv1.HorizonEndpointChangedPredicate)).
-		Complete(r)
+			builder.WithPredicates(horizonv1.HorizonEndpointChangedPredicate))
+
+	// Add keystone-overrides secret watcher for SKMO support
+	cBuilder = AddKeystoneOverridesWatches(cBuilder)
+
+	return cBuilder.Complete(r)
 }
 
 func (r *GlanceAPIReconciler) findObjectsForSrc(ctx context.Context, src client.Object) []reconcile.Request {
@@ -1176,6 +1181,59 @@ func (r *GlanceAPIReconciler) generateServiceConfig(
 		return err
 	}
 
+	// Check for keystone overrides for multi-region deployments
+	keystoneOverrides, err := keystone.GetKeystoneOverridesByLabel(
+		ctx, h, instance.Namespace, "keystone-overrides")
+	if err != nil {
+		// Log the error but continue with defaults - keystone overrides are optional
+		h.GetLogger().V(1).Info("Could not get keystone overrides, using defaults", "error", err.Error())
+		keystoneOverrides = map[string]string{}
+	}
+
+	// Use keystone overrides if available, otherwise use defaults
+	finalKeystonePublicURL := keystonePublicURL
+	if wwwAuthURI, exists := keystoneOverrides["www_authenticate_uri"]; exists && strings.TrimSpace(wwwAuthURI) != "" {
+		finalKeystonePublicURL = strings.TrimSpace(wwwAuthURI)
+	} else if authURL, exists := keystoneOverrides["auth_url"]; exists && strings.TrimSpace(authURL) != "" {
+		finalKeystonePublicURL = strings.TrimSpace(authURL)
+	}
+	finalKeystoneInternalURL := keystoneInternalURL
+	if authURL, exists := keystoneOverrides["auth_url"]; exists && strings.TrimSpace(authURL) != "" {
+		finalKeystoneInternalURL = strings.TrimSpace(authURL)
+	}
+	finalRegion := ""
+	if region, exists := keystoneOverrides["region"]; exists && strings.TrimSpace(region) != "" {
+		finalRegion = strings.TrimSpace(region)
+	}
+
+	if len(keystoneOverrides) > 0 {
+		logArgs := []interface{}{}
+		if finalKeystonePublicURL != keystonePublicURL {
+			logArgs = append(logArgs, "public_url", finalKeystonePublicURL)
+		}
+		if finalKeystoneInternalURL != keystoneInternalURL {
+			logArgs = append(logArgs, "internal_url", finalKeystoneInternalURL)
+		}
+		if finalRegion != "" {
+			logArgs = append(logArgs, "region", finalRegion)
+		}
+		if len(logArgs) > 0 {
+			h.GetLogger().Info("Using keystone overrides for multi-region deployment", logArgs...)
+		}
+
+		// Add keystone overrides to envVars for hash calculation
+		keystoneOverridesHash, err := util.ObjectHash(keystoneOverrides)
+		if err != nil {
+			return fmt.Errorf("error creating keystone overrides hash: %w", err)
+		}
+		(*envVars)["keystoneOverridesHash"] = env.SetValue(keystoneOverridesHash)
+	}
+
+	// Set default region if not overridden
+	if finalRegion == "" {
+		finalRegion = keystoneAPI.GetRegion()
+	}
+
 	ospSecret, _, err := secret.GetSecret(ctx, h, instance.Spec.Secret, instance.Namespace)
 	if err != nil {
 		return err
@@ -1212,8 +1270,8 @@ func (r *GlanceAPIReconciler) generateServiceConfig(
 	templateParameters := map[string]interface{}{
 		"ServiceUser":         instance.Spec.ServiceUser,
 		"ServicePassword":     string(ospSecret.Data[instance.Spec.PasswordSelectors.Service]),
-		"KeystoneInternalURL": keystoneInternalURL,
-		"KeystonePublicURL":   keystonePublicURL,
+		"KeystoneInternalURL": finalKeystoneInternalURL,
+		"KeystonePublicURL":   finalKeystonePublicURL,
 		"DatabaseConnection": fmt.Sprintf("mysql+pymysql://%s:%s@%s/%s?read_default_file=/etc/my.cnf",
 			databaseAccount.Spec.UserName,
 			string(dbSecret.Data[mariadbv1.DatabasePasswordSelector]),
@@ -1235,7 +1293,7 @@ func (r *GlanceAPIReconciler) generateServiceConfig(
 	// .Status.
 	if len(endpointID) > 0 {
 		templateParameters["EndpointID"] = endpointID
-		templateParameters["Region"] = keystoneAPI.GetRegion()
+		templateParameters["Region"] = finalRegion
 	}
 
 	// Configure the internal GlanceAPI to provide image location data, and the

@@ -16,9 +16,10 @@ limitations under the License.
 package glance
 
 import (
+	"time"
+
 	"github.com/openstack-k8s-operators/lib-common/modules/storage"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"time"
 )
 
 // CronJobType -
@@ -108,6 +109,9 @@ const (
 	ShortDuration = time.Duration(5) * time.Second
 	// NormalDuration -
 	NormalDuration = time.Duration(10) * time.Second
+
+	// KeystoneOverridesLabel label for marking secrets containing keystone overrides for SKMO
+	KeystoneOverridesLabel = "keystone-overrides"
 )
 
 // DbsyncPropagation keeps track of the DBSync Service Propagation Type
