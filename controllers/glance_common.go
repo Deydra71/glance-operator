@@ -308,7 +308,7 @@ func GetServiceLabels(
 
 // AddKeystoneOverridesWatches adds keystone-overrides secret watches to the passed controller builder
 func AddKeystoneOverridesWatches(b *builder.Builder) *builder.Builder {
-	keystoneOverridesMap := handler.MapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
+	keystoneOverridesMap := handler.MapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 		name := obj.GetName()
 		ns := obj.GetNamespace()
 
@@ -325,6 +325,10 @@ func AddKeystoneOverridesWatches(b *builder.Builder) *builder.Builder {
 		if _, hasLabel := labels[glance.KeystoneOverridesLabel]; !hasLabel {
 			return nil
 		}
+
+		// DEBUG: Watcher activation
+		log.FromContext(ctx).Info("Glance keystone-overrides watcher activated",
+			"secret", name, "namespace", ns)
 
 		svc := "glance"
 		if name != "keystone-overrides" && strings.HasSuffix(name, "-keystone-overrides") {
